@@ -1,19 +1,4 @@
 #!/usr/bin/env python3
-"""
-Clean Spread Movement Tracker Bot
-----------------------------------
-Logic:
-1. Full scan → shortlist symbols with ABS(spread) >= 0.2%
-2. Log ALL scans (Binance prices, KuCoin prices, spread)
-3. Monitor shortlisted symbols for 10 minutes
-4. Count movements:
-       Every time ABS(current_spread - previous_reference) >= 0.5%
-       → movement_count += 1
-       → reference = current_spread
-5. End-of-window report with detailed stats
-6. Loop repeats forever
-"""
-
 import time
 import requests
 import logging
@@ -21,310 +6,282 @@ from logging.handlers import RotatingFileHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-# ===================== CONFIG ============================
-SCAN_THRESHOLD = 0.2          # shortlist threshold (ABS spread)
-MOVEMENT_STEP = 0.5           # count movement every ±0.5% change
-MONITOR_DURATION = 600        # 10 minutes
-POLL_INTERVAL = 2             # seconds
-MAX_WORKERS = 20              # thread pool
+# ============================= CONFIG =============================
+TELEGRAM_TOKEN = "8589870096:AAHahTpg6LNXbUwUMdt3q2EqVa2McIo14h8"
+TELEGRAM_CHAT_IDS = ["5054484162", "497819952"]
 
-# Telegram (optional)
-TELEGRAM_TOKEN = "<YOUR TOKEN>"    # leave <> for disabled
-TELEGRAM_CHAT_IDS = ["<CHAT ID>"]  # leave <> for disabled
-# ==========================================================
+SCAN_THRESHOLD = 0.20        # Initial filter: >= ±0.20% spread
+MOVEMENT_STEP = 0.50         # Count +1 every time spread moves this much from last counted point
+MONITOR_DURATION = 600       # 10 minutes
+MONITOR_POLL = 2             # Poll every 2 seconds
+MAX_WORKERS = 12
+# ==================================================================
 
+# API endpoints
+BINANCE_INFO_URL = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+BINANCE_BOOK_URL = "https://fapi.binance.com/fapi/v1/ticker/bookTicker"
+BINANCE_TICKER_URL = "https://fapi.binance.com/fapi/v1/ticker/bookTicker?symbol={symbol}"
+KUCOIN_ACTIVE_URL = "https://api-futures.kucoin.com/api/v1/contracts/active"
+KUCOIN_TICKER_URL = "https://api-futures.kucoin.com/api/v1/ticker?symbol={symbol}"
 
-# ===================== LOGGING ============================
-logger = logging.getLogger("movement_bot")
+# -------------------- Logging setup --------------------
+logger = logging.getLogger("spread_tracker")
 logger.setLevel(logging.DEBUG)
 
-console = logging.StreamHandler()
-console.setLevel(logging.INFO)
-console.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
-logger.addHandler(console)
+ch = logging.StreamHandler()
+ch.setLevel(logging.INFO)
+ch_formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
+ch.setFormatter(ch_formatter)
+logger.addHandler(ch)
 
-fileh = RotatingFileHandler("movement_bot.log", maxBytes=10_000_000, backupCount=5)
-fileh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
-fileh.setLevel(logging.DEBUG)
-logger.addHandler(fileh)
+fh = RotatingFileHandler("spread_tracker.log", maxBytes=10_000_000, backupCount=5)
+fh.setLevel(logging.DEBUG)
+fh_formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+fh.setFormatter(fh_formatter)
+logger.addHandler(fh)
 
-
-# ===================== SMALL UTILS ============================
 def ts():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-
+# -------------------- Telegram --------------------
 def send_telegram(msg):
-    if TELEGRAM_TOKEN.startswith("<"):
-        return
-    for cid in TELEGRAM_CHAT_IDS:
-        if cid.startswith("<"):
-            continue
+    for chat_id in TELEGRAM_CHAT_IDS:
         try:
             requests.get(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                params={"chat_id": cid, "text": msg},
-                timeout=5
+                params={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown", "disable_web_page_preview": True},
+                timeout=10
             )
         except:
             pass
 
-
-def normalize(symbol):
-    s = symbol.upper()
-    if s.endswith("USDTM") or s.endswith("USDTP") or s.endswith("M"):
-        return s[:-1]
+# -------------------- Symbol helpers --------------------
+def normalize(s):
+    if not s: return s
+    s = s.upper()
+    if s.endswith(("USDTM", "USDTP", "M")):
+        return s.rsplit("M", 1)[0].rsplit("P", 1)[0]
     return s
 
-
-# ===================== EXCHANGE FETCH ============================
-BINANCE_INFO_URL = "https://fapi.binance.com/fapi/v1/exchangeInfo"
-BINANCE_BOOK_URL = "https://fapi.binance.com/fapi/v1/ticker/bookTicker"
-BINANCE_TICK_URL = "https://fapi.binance.com/fapi/v1/ticker/bookTicker?symbol={}"
-
-KUCOIN_INFO_URL = "https://api-futures.kucoin.com/api/v1/contracts/active"
-KUCOIN_TICK_URL = "https://api-futures.kucoin.com/api/v1/ticker?symbol={}"
-
-
-def get_binance_symbols():
-    try:
-        r = requests.get(BINANCE_INFO_URL, timeout=10)
-        data = r.json()
-        return [
-            s["symbol"] for s in data["symbols"]
-            if s["contractType"] == "PERPETUAL" and s["status"] == "TRADING"
-        ]
-    except:
-        logger.exception("Failed to fetch binance symbols")
-        return []
-
-
-def get_kucoin_symbols():
-    try:
-        r = requests.get(KUCOIN_INFO_URL, timeout=10)
-        data = r.json().get("data", [])
-        return [s["symbol"] for s in data if s.get("status") == "open"]
-    except:
-        logger.exception("Failed to fetch kucoin symbols")
-        return []
-
-
 def get_common_symbols():
-    bin_syms = get_binance_symbols()
-    ku_syms = get_kucoin_symbols()
+    def fetch_binance():
+        try:
+            r = requests.get(BINANCE_INFO_URL, timeout=10).json()
+            return [s["symbol"] for s in r["symbols"] if s.get("contractType") == "PERPETUAL" and s.get("status") == "TRADING"]
+        except: return []
 
+    def fetch_kucoin():
+        try:
+            r = requests.get(KUCOIN_ACTIVE_URL, timeout=10).json()
+            return [c["symbol"] for c in r.get("data", []) if c.get("status", "").lower() == "open"]
+        except: return []
+
+    bin_syms = fetch_binance()
+    ku_syms = fetch_kucoin()
     bin_set = {normalize(s) for s in bin_syms}
     ku_set = {normalize(s) for s in ku_syms}
-
     common = bin_set.intersection(ku_set)
 
-    # map normalized → kucoin raw
     ku_map = {}
     for s in ku_syms:
-        ku_map[normalize(s)] = s
+        n = normalize(s)
+        if n not in ku_map:
+            ku_map[n] = s
 
+    logger.info(f"Common perpetual symbols: {len(common)}")
     return common, ku_map
 
-
+# -------------------- Price fetchers --------------------
 def get_binance_book():
     try:
-        r = requests.get(BINANCE_BOOK_URL, timeout=6)
-        data = r.json()
-        out = {}
-        for d in data:
-            try:
-                out[d["symbol"]] = {
-                    "bid": float(d["bidPrice"]),
-                    "ask": float(d["askPrice"])
-                }
-            except:
-                pass
-        return out
+        data = requests.get(BINANCE_BOOK_URL, timeout=10).json()
+        book = {}
+        for item in data:
+            if item["bidPrice"] and item["askPrice"]:
+                book[item["symbol"]] = {"bid": float(item["bidPrice"]), "ask": float(item["askPrice"])}
+        return book
     except:
-        logger.exception("Failed binance book")
         return {}
 
-
-def get_binance_price(symbol, session):
+def get_price_binance(symbol, session):
     try:
-        r = session.get(BINANCE_TICK_URL.format(symbol), timeout=6)
-        d = r.json()
-        return float(d["bidPrice"]), float(d["askPrice"])
-    except:
-        return None, None
-
-
-def get_kucoin_price(symbol, session):
-    try:
-        r = session.get(KUCOIN_TICK_URL.format(symbol), timeout=6)
-        d = r.json().get("data", {})
-        bid = float(d.get("bestBidPrice") or d.get("bid") or 0)
-        ask = float(d.get("bestAskPrice") or d.get("ask") or 0)
-        if bid > 0 and ask > 0:
-            return bid, ask
-    except:
-        pass
+        r = session.get(BINANCE_TICKER_URL.format(symbol=symbol), timeout=6)
+        if r.status_code == 200:
+            d = r.json()
+            bid = float(d.get("bidPrice") or 0)
+            ask = float(d.get("askPrice") or 0)
+            if bid > 0 and ask > 0:
+                return bid, ask
+    except: pass
     return None, None
 
-
-def batch_kucoin(symbols):
-    out = {}
-    with requests.Session() as session:
-        with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(symbols))) as ex:
-            futs = {ex.submit(get_kucoin_price, s, session): s for s in symbols}
-            for f in as_completed(futs):
-                sym = futs[f]
-                try:
-                    b, a = f.result()
-                    if b and a:
-                        out[sym] = {"bid": b, "ask": a}
-                except:
-                    pass
-    return out
-
-
-# ===================== SPREAD LOGIC ============================
-def calc_spread(bb, ba, kb, ka):
+def get_price_kucoin(symbol, session):
     try:
-        pos = ((kb - ba) / ba) * 100
-        neg = ((ka - bb) / bb) * 100
-        if pos > 0:
-            return pos
-        if neg < 0:
-            return neg
-        return None
-    except:
-        return None
+        r = session.get(KUCOIN_TICKER_URL.format(symbol=symbol), timeout=6)
+        if r.status_code == 200:
+            d = r.json().get("data", {})
+            bid = float(d.get("bestBidPrice") or d.get("bid") or 0)
+            ask = float(d.get("bestAskPrice") or d.get("ask") or 0)
+            if bid > 0 and ask > 0:
+                return bid, ask
+    except: pass
+    return None, None
 
+# -------------------- Spread calculation --------------------
+def calculate_spread(bin_bid, bin_ask, ku_bid, ku_ask):
+    if not all(v > 0 for v in [bin_bid, bin_ask, ku_bid, ku_ask]):
+        return None
+    pos = (ku_bid - bin_ask) / bin_ask * 100
+    neg = (ku_ask - bin_bid) / bin_bid * 100
+    if pos > 0.01:
+        return round(pos, 5)
+    if neg < -0.01:
+        return round(neg, 5)
+    return None
 
-# ===================== MAIN BOT ============================
+# -------------------- Main Loop --------------------
 def main():
-    logger.info("=== Movement Bot Started (threshold=0.2%, step=0.5%) ===")
+    logger.info("Spread Movement Tracker STARTED")
+    send_telegram("Spread Movement Tracker Started\nFull scan → 10 min tracking → report → repeat")
 
     session = requests.Session()
 
     while True:
+        start_time = time.time()
+
         try:
-            logger.info("========== FULL SCAN START ==========")
-
+            # === 1. Full Scan & Candidate Selection ===
             common, ku_map = get_common_symbols()
-            bin_book = get_binance_book()
-
-            ku_syms = [ku_map.get(s, s+"M") for s in common]
-            ku_prices = batch_kucoin(ku_syms)
-
-            candidates = {}
-
-            # ---- Full scan logging ----
-            for sym in common:
-                if sym not in bin_book:
-                    continue
-                b = bin_book[sym]
-                ku_sym = ku_map.get(sym, sym + "M")
-                k = ku_prices.get(ku_sym)
-
-                if not k:
-                    continue
-
-                spread = calc_spread(b["bid"], b["ask"], k["bid"], k["ask"])
-
-                logger.info(f"[SCAN] {sym} | BIN({b['bid']}/{b['ask']}) "
-                            f"KU({k['bid']}/{k['ask']}) → {spread:+.4f}%")
-
-                if spread is not None and abs(spread) >= SCAN_THRESHOLD:
-                    candidates[sym] = {
-                        "ku": ku_sym,
-                        "reference": spread,     # dynamic reference point
-                        "movements": 0,
-                        "max": spread,
-                        "min": spread,
-                        "samples": 0,
-                        "movement_times": []
-                    }
-
-            logger.info(f"Shortlisted {len(candidates)} symbols: {list(candidates.keys())}")
-
-            if not candidates:
-                time.sleep(3)
+            if not common:
+                time.sleep(10)
                 continue
 
-            logger.info("===== MONITORING 10 MIN START =====")
+            bin_book = get_binance_book()
+            candidates = {}
 
-            end_time = time.time() + MONITOR_DURATION
+            for norm_sym in common:
+                bin_sym = norm_sym
+                ku_sym = ku_map.get(norm_sym, norm_sym + "M")
 
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as EX:
-                while time.time() < end_time:
-                    start = time.time()
+                bin_tick = bin_book.get(bin_sym)
+                if not bin_tick:
+                    continue
 
+                ku_bid, ku_ask = get_price_kucoin(ku_sym, session)
+                if not ku_bid or not ku_ask:
+                    continue
+
+                spread = calculate_spread(bin_tick["bid"], bin_tick["ask"], ku_bid, ku_ask)
+                if spread is not None and abs(spread) >= SCAN_THRESHOLD:
+                    candidates[norm_sym] = {
+                        "bin_sym": bin_sym,
+                        "ku_sym": ku_sym,
+                        "last_spread": spread,
+                        "reference_point": spread,   # This is the point we count moves FROM
+                        "move_count": 0,
+                        "history": [(time.time(), spread)]
+                    }
+
+            logger.info(f"SCAN COMPLETE → {len(candidates)} candidates selected for 10-min tracking")
+            if not candidates:
+                logger.info("No candidates found. Sleeping 60s...")
+                send_telegram("No coins with ≥0.2% spread found.")
+                time.sleep(60)
+                continue
+
+            send_telegram(f"Tracking {len(candidates)} coins for 10 minutes...\n" + ", ".join(list(candidates.keys())[:15]))
+
+            # === 2. 10-Minute Continuous Tracking ===
+            end_time = start_time + MONITOR_DURATION
+            poll_count = 0
+
+            while time.time() < end_time:
+                poll_start = time.time()
+                poll_count += 1
+
+                # Fetch all current prices in parallel
+                latest = {}
+                with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(candidates)*2)) as ex:
                     futures = {}
+                    for norm_sym, info in candidates.items():
+                        futures[ex.submit(get_price_binance, info["bin_sym"], session)] = ("bin", norm_sym)
+                        futures[ex.submit(get_price_kucoin, info["ku_sym"], session)] = ("ku", norm_sym)
 
-                    # submit tasks
-                    for sym, info in candidates.items():
-                        futures[EX.submit(get_binance_price, sym, session)] = ("bin", sym)
-                        futures[EX.submit(get_kucoin_price, info["ku"], session)] = ("ku", sym)
-
-                    # collect
-                    latest = {s: {"bin": None, "ku": None} for s in candidates}
                     for f in as_completed(futures):
                         typ, sym = futures[f]
                         try:
-                            b, a = f.result()
-                            if b and a:
-                                latest[sym][typ] = {"bid": b, "ask": a}
+                            bid, ask = f.result()
+                            if bid and ask:
+                                latest.setdefault(sym, {})[typ] = {"bid": bid, "ask": ask}
                         except:
                             pass
 
-                    # process
-                    for sym, info in candidates.items():
-                        B = latest[sym]["bin"]
-                        K = latest[sym]["ku"]
-                        if not B or not K:
-                            continue
+                # Process each candidate
+                for norm_sym, info in list(candidates.items()):
+                    data = latest.get(norm_sym, {})
+                    bin_p = data.get("bin")
+                    ku_p = data.get("ku")
+                    if not bin_p or not ku_p:
+                        continue
 
-                        spread = calc_spread(B["bid"], B["ask"], K["bid"], K["ask"])
-                        if spread is None:
-                            continue
+                    spread = calculate_spread(bin_p["bid"], bin_p["ask"], ku_p["bid"], ku_p["ask"])
+                    if spread is None:
+                        continue
 
-                        info["samples"] += 1
-                        info["max"] = max(info["max"], spread)
-                        info["min"] = min(info["min"], spread)
+                    old_ref = info["reference_point"]
+                    delta = spread - old_ref
 
-                        # ===== MOVEMENT LOGIC =====
-                        if abs(spread - info["reference"]) >= MOVEMENT_STEP:
-                            info["movements"] += 1
-                            info["movement_times"].append(f"{ts()} ({spread:+.4f}%)")
-                            info["reference"] = spread  # reset reference
+                    if abs(delta) >= MOVEMENT_STEP:
+                        steps = int(abs(delta) // MOVEMENT_STEP)
+                        direction = "UP" if delta > 0 else "DOWN"
+                        info["move_count"] += steps
+                        info["reference_point"] = old_ref + (steps * MOVEMENT_STEP * (1 if delta > 0 else -1))
+                        info["last_spread"] = spread
+                        info["history"].append((time.time(), spread))
 
-                    # wait for next poll
-                    elapsed = time.time() - start
-                    if elapsed < POLL_INTERVAL:
-                        time.sleep(POLL_INTERVAL - elapsed)
+                        logger.info(f"MOVE | {norm_sym:8} | {old_ref:+.4f}% → {spread:+.4f}% | "
+                                    f"Δ={delta:+.4f}% | +{steps} move(s) | Total: {info['move_count']}")
 
-            # ===== REPORT =====
-            logger.info("===== END WINDOW | REPORT =====")
+                # Sleep to maintain poll interval
+                elapsed = time.time() - poll_start
+                if elapsed < MONITOR_POLL:
+                    time.sleep(MONITOR_POLL - elapsed)
 
-            report_lines = []
-            report_lines.append(f"10-min Movement Report ({ts()})")
+            # === 3. Final Report ===
+            if candidates:
+                sorted_candidates = sorted(candidates.items(), key=lambda x: x[1]["move_count"], reverse=True)
+                report = f"*10-Minute Movement Report* — {ts()}\n\n"
+                report += f"Tracked: {len(candidates)} coins | Polls: ~{poll_count}\n"
+                report += "Ranked by number of 0.5%+ moves:\n\n"
 
-            for sym, info in candidates.items():
-                line = (
-                    f"{sym} | movements={info['movements']} | "
-                    f"min={info['min']:+.4f}% | max={info['max']:+.4f}% | "
-                    f"samples={info['samples']}"
-                )
-                report_lines.append(line)
+                rank = 1
+                for sym, info in sorted_candidates:
+                    if info["move_count"] > 0:
+                        first = info["history"][0][1]
+                        last = info["history"][-1][1]
+                        max_sp = max(h[1] for h in info["history"])
+                        min_sp = min(h[1] for h in info["history"])
+                        report += (f"{rank}. `{sym}` → *{info['move_count']} moves* | "
+                                   f"Start: {first:+.3f}% → End: {last:+.3f}% | "
+                                   f"Range: {min_sp:+.3f} to {max_sp:+.3f}%\n")
+                        rank += 1
 
-                if info["movement_times"]:
-                    report_lines.append("   moves: " + ", ".join(info["movement_times"][-8:]))
+                if rank == 1:
+                    report += "No coin moved ≥0.5% during the window.\n"
 
-            final_report = "\n".join(report_lines)
-            logger.info("\n" + final_report)
-            send_telegram(final_report)
+                logger.info("10-MIN REPORT:\n" + report)
+                send_telegram(report)
+            else:
+                send_telegram("No candidates survived the 10-minute window.")
 
-        except Exception:
-            logger.exception("Main loop error")
-            time.sleep(5)
-
+        except Exception as e:
+            logger.exception("Error in main loop")
+            send_telegram(f"Bot error: {e}")
+            time.sleep(10)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.info("Stopped by user")
+        send_telegram("Spread tracker stopped.")
